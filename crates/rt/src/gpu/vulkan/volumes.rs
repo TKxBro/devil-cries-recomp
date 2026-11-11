@@ -195,12 +195,17 @@ impl Renderer {
             return Ok(Some(found));
         }
         let key = ImageKey { cpu, format: format.vk, width: header.width, height: header.height };
+        if self.images.get(&key).is_some_and(|i| !i.gpu_dirty && (i.levels != levels || i.layers != layers)) {
+            self.destroy_image(key);
+        }
         if self.images.contains_key(&key) {
             return Ok(None);
         }
         self.create_image(key, levels, layers).map_err(|e| format!("image: {e:?}"))?;
-        let data = read_texture(gpu, mem, header, format, levels, layers);
-        self.upload_layers(key, levels as usize, &data);
+        self.upload_texture(gpu, mem, key, header, format, levels, layers);
+        let hash = super::textures::texture_hash(gpu, mem, header, format, levels, layers).unwrap_or(0);
+        let frame = crate::display::FRAMES.load(std::sync::atomic::Ordering::Relaxed);
+        self.images.get_mut(&key).unwrap().source = Some(super::textures::Source { hash, checked: frame, volatile: false });
         Ok(Some((key, 0)))
     }
 
@@ -216,6 +221,7 @@ impl Renderer {
                     && (k.width, k.height) == (header.width, header.height)
                     && same_class(k.format, format.vk)
                     && (i.levels > 1 || i.layers > 1)
+                    && (i.gpu_dirty || i.levels == levels)
                     && i.layers >= header.depth.max(1)
             })
             .find_map(|(k, i)| {

@@ -202,6 +202,14 @@ impl WavDump {
     }
 }
 
+impl Drop for WavDump {
+    fn drop(&mut self) {
+        let _ = self.header();
+        use std::io::Write;
+        let _ = self.file.flush();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

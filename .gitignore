@@ -43,3 +43,11 @@ __pycache__/
 side-session-notes/
 .claude/
 dist/
+
+# Local experiments, diagnostics, and helper scripts.
+diagnostics/
+out-*/
+target-asm/
+run-*.sh
+*.log
+

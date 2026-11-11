@@ -28,13 +28,21 @@ pub fn uncapped_fps(frames: u64, secs: f64, paced: u64) -> f64 {
 static LONGEST: AtomicU64 = AtomicU64::new(0);
 static LAST_FRAME: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
 
-fn note_frame() {
+fn note_frame(p: &Process) {
     let now = std::time::Instant::now();
     if let Some(last) = LAST_FRAME.lock().unwrap().replace(now) {
-        LONGEST.fetch_max((now - last).as_nanos() as u64, Ordering::Relaxed);
-        if now - last > std::time::Duration::from_millis(100) && std::env::var("KIRIKAE_STATS").is_ok_and(|v| v == "2") {
+        let elapsed = now - last;
+        LONGEST.fetch_max(elapsed.as_nanos() as u64, Ordering::Relaxed);
+        if elapsed > std::time::Duration::from_millis(100) && std::env::var("KIRIKAE_STATS").is_ok_and(|v| v == "2") {
             let unix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
-            eprintln!("kirikae: hitch: frame {} took {:.0} ms, ending at {:.3}", FRAMES.load(Ordering::Relaxed), (now - last).as_secs_f64() * 1e3, unix.as_secs_f64());
+            eprintln!("kirikae: hitch: frame {} took {:.0} ms, ending at {:.3}", FRAMES.load(Ordering::Relaxed), elapsed.as_secs_f64() * 1e3, unix.as_secs_f64());
+            if std::env::var("KIRIKAE_HITCH_DIAGNOSTICS").is_ok_and(|v| v == "1") {
+                let blocked = crate::sched::blocked_threads(p);
+                eprintln!("kirikae: hitch detail: live_threads={} kernel_lock={} blocked={}", p.sched.live.load(Ordering::Relaxed), if p.sched.kernel_busy() { "held" } else { "free" }, blocked.len());
+                for line in blocked.iter().take(12) {
+                    eprintln!("kirikae: hitch blocked: {line}");
+                }
+            }
         }
     }
 }
@@ -110,7 +118,7 @@ fn dumps(next: u64) -> bool {
 
 pub fn presented(p: &Process, dump: Option<&Frame>) {
     let n = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
-    note_frame();
+    note_frame(p);
     if n == 1 {
         p.warn_once("display: first frame presented (Vulkan swapchain)".to_string());
     }
@@ -172,7 +180,7 @@ pub fn start(p: &'static Process, title: String) {
 
 pub fn present(p: &Process, frame: Frame) {
     let n = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
-    note_frame();
+    note_frame(p);
     if n == 1 {
         p.warn_once(format!("display: first frame presented ({}x{})", frame.width, frame.height));
     }
@@ -210,7 +218,10 @@ impl ApplicationHandler<Shown> for App {
         if self.window.is_some() {
             return;
         }
-        let attrs = Window::default_attributes().with_title(&self.title).with_inner_size(LogicalSize::new(1280.0, 720.0));
+        let mut attrs = Window::default_attributes().with_title(&self.title).with_inner_size(LogicalSize::new(1280.0, 720.0));
+        if std::env::var_os("KIRIKAE_FULLSCREEN").is_some_and(|v| v == "1") {
+            attrs = attrs.with_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
+        }
         let window = match el.create_window(attrs) {
             Ok(w) => Rc::new(w),
             Err(e) => {
@@ -257,6 +268,17 @@ impl ApplicationHandler<Shown> for App {
             WindowEvent::RedrawRequested => self.draw(),
             WindowEvent::KeyboardInput { event, .. } => {
                 if let winit::keyboard::PhysicalKey::Code(code) = event.physical_key {
+                    if code == winit::keyboard::KeyCode::F11 && event.state.is_pressed() && !event.repeat {
+                        if let Some(w) = &self.window {
+                            let next = if w.fullscreen().is_some() {
+                                None
+                            } else {
+                                Some(winit::window::Fullscreen::Borderless(None))
+                            };
+                            w.set_fullscreen(next);
+                        }
+                        return;
+                    }
                     crate::input::key(code, event.state.is_pressed());
                 }
             }

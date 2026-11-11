@@ -62,7 +62,16 @@ impl Renderer {
             }
             let (addr, size) = cbuf.unwrap_or((0, 0));
             let used = s.shader.cbuf_used[slot] as u64;
-            let size = (size as u64).min(used.next_multiple_of(16)).clamp(16, MAX_CBUF);
+            let mut size = (size as u64).min(used.next_multiple_of(16)).clamp(16, MAX_CBUF);
+            if let Some(c) = gpu.translate(addr) {
+                let r = mem.query(c);
+                if r.range.contains(&c) {
+                    let avail = r.range.end - c;
+                    if avail > 0 {
+                        size = size.min(avail).clamp(16, MAX_CBUF);
+                    }
+                }
+            }
             self.stats.cbuf_bytes += size;
             if let Some(spec) = crate::env_var!("KIRIKAE_CBUF_DUMP") {
                 let spec = spec.to_string_lossy().into_owned();

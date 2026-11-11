@@ -359,6 +359,15 @@ impl Renderer {
             Some(d) => self.ring_copy(d, align),
             None if zeros => self.ring_alloc(size, align).map(|(o, dst)| {
                 dst.fill(0);
+                if let Some(c) = cpu {
+                    let r = mem.query(c);
+                    if r.range.contains(&c) {
+                        let avail = (r.range.end - c).min(size) as usize;
+                        if let Some(data) = mem.bytes(c, avail as u64) {
+                            dst[..avail].copy_from_slice(data);
+                        }
+                    }
+                }
                 o
             }),
             None => return Err(format!("guest memory at GPU address {va:#x} ({size:#x} bytes) unreadable")),

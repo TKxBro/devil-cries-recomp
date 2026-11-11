@@ -26,6 +26,11 @@ pub(crate) fn trace() -> bool {
     *ON.get_or_init(|| std::env::var_os("KIRIKAE_TRACE_VIDEO").is_some())
 }
 
+pub(crate) fn media_timing() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KIRIKAE_TRACE_MEDIA_TIMING").is_some())
+}
+
 #[derive(Default)]
 struct Iova {
     handles: HashMap<u32, u64>,
@@ -64,6 +69,7 @@ pub struct Dma<'a> {
     mem: &'a GuestMemory,
     gpu: &'a Gpu,
     later: Option<Later<'a>>,
+    h264: Option<Arc<H264Worker>>,
 }
 
 type Later<'a> = (&'static Process, &'a Arc<Mutex<Iova>>, &'a Arc<Worker>);
@@ -77,7 +83,7 @@ impl Dma<'_> {
                 let iova = iova.clone();
                 worker.push(p, Box::new(move || {
                     let iova = iova.lock().unwrap();
-                    job(&Dma { iova: &iova, mem: &p.memory, gpu: &p.gpu, later: None })
+                    job(&Dma { iova: &iova, mem: &p.memory, gpu: &p.gpu, later: None, h264: None })
                 }));
                 Ok(())
             }
@@ -151,12 +157,218 @@ impl Worker {
     }
 }
 
+struct H264Queue<T> {
+    items: VecDeque<T>,
+    capacity: usize,
+}
+
+impl<T> H264Queue<T> {
+    fn new(capacity: usize) -> H264Queue<T> {
+        assert!(capacity > 0);
+        H264Queue { items: VecDeque::with_capacity(capacity), capacity }
+    }
+
+    fn push(&mut self, item: T) -> Result<(), T> {
+        if self.items.len() == self.capacity {
+            Err(item)
+        } else {
+            self.items.push_back(item);
+            Ok(())
+        }
+    }
+
+    fn pop(&mut self) -> Option<T> {
+        self.items.pop_front()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    fn is_full(&self) -> bool {
+        self.items.len() == self.capacity
+    }
+}
+
+impl<T> Default for H264Queue<T> {
+    fn default() -> Self {
+        H264Queue::new(8)
+    }
+}
+
+struct H264Job {
+    process: &'static Process,
+    iova: Arc<Mutex<Iova>>,
+    context: u32,
+    info: h264::PictureInfo,
+    slices: Vec<u8>,
+    output_surface: usize,
+    luma: u32,
+    chroma: u32,
+}
+
+enum H264Work {
+    Decode(H264Job),
+    Callback(Box<dyn FnOnce() -> Result<(), String> + Send>),
+}
+
+struct H264Item {
+    work: H264Work,
+    done: Arc<(Mutex<Option<Result<(), String>>>, Condvar)>,
+}
+
+pub(crate) struct H264Completion {
+    done: Arc<(Mutex<Option<Result<(), String>>>, Condvar)>,
+}
+
+impl H264Completion {
+    pub(crate) fn wait(self) -> Result<(), String> {
+        let (done, changed) = &*self.done;
+        let mut result = done.lock().unwrap();
+        while result.is_none() {
+            result = changed.wait(result).unwrap();
+        }
+        result.take().unwrap()
+    }
+}
+
+impl H264Item {
+    fn completion(&self) -> H264Completion {
+        H264Completion { done: self.done.clone() }
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct H264Worker {
+    state: Mutex<(H264Queue<H264Item>, bool, bool)>,
+    changed: Condvar,
+}
+
+impl H264Worker {
+    fn enqueue(self: &Arc<Self>, work: H264Work) -> Result<H264Completion, String> {
+        let item = H264Item { work, done: Arc::new((Mutex::new(None), Condvar::new())) };
+        let completion = item.completion();
+        let mut state = self.state.lock().unwrap();
+        while state.0.is_full() {
+            state = self.changed.wait(state).unwrap();
+        }
+        if !state.2 {
+            state.2 = true;
+            let worker = self.clone();
+            if let Err(e) = std::thread::Builder::new().name("kirikae-h264-worker".into()).spawn(move || worker.run()) {
+                state.2 = false;
+                return Err(format!("NVDEC: cannot start H.264 worker: {e}"));
+            }
+        }
+        let _ = state.0.push(item);
+        self.changed.notify_all();
+        Ok(completion)
+    }
+
+    fn callback(self: &Arc<Self>, callback: impl FnOnce() -> Result<(), String> + Send + 'static) -> Result<H264Completion, String> {
+        self.enqueue(H264Work::Callback(Box::new(callback)))
+    }
+
+    fn drain(&self) {
+        let mut state = self.state.lock().unwrap();
+        while !state.0.is_empty() || state.1 {
+            state = self.changed.wait(state).unwrap();
+        }
+    }
+
+    fn run(self: Arc<Self>) {
+        let mut decoders = HashMap::new();
+        loop {
+            let item = {
+                let mut state = self.state.lock().unwrap();
+                while state.0.is_empty() {
+                    state.1 = false;
+                    self.changed.notify_all();
+                    state = self.changed.wait(state).unwrap();
+                }
+                state.1 = true;
+                let item = state.0.pop().unwrap();
+                self.changed.notify_all();
+                item
+            };
+            let H264Item { work, done } = item;
+            let result = match work {
+                H264Work::Decode(job) => decode_h264_job(&mut decoders, job),
+                H264Work::Callback(callback) => callback(),
+            };
+            let (finished, changed) = &*done;
+            *finished.lock().unwrap() = Some(result);
+            changed.notify_all();
+            let mut state = self.state.lock().unwrap();
+            state.1 = false;
+            self.changed.notify_all();
+        }
+    }
+}
+
+fn decode_h264_job(decoders: &mut HashMap<u32, h264::Decoder>, job: H264Job) -> Result<(), String> {
+    let H264Job { process, iova, context, info, slices, output_surface, luma, chroma } = job;
+    if let Some(dir) = std::env::var_os("KIRIKAE_VIDEO_DUMP") {
+        let path = std::path::Path::new(&dir).join(format!("nvdec-{context}.h264"));
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            use std::io::Write;
+            let _ = f.write_all(&h264::parameter_sets(&info));
+            let _ = f.write_all(&slices);
+        }
+    }
+    let decoder = match decoders.entry(context) {
+        std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+        std::collections::hash_map::Entry::Vacant(e) => e.insert(h264::Decoder::new()?),
+    };
+    let frames = decoder.decode_surface(&info, &slices, (output_surface, luma, chroma))?;
+    if trace() {
+        eprintln!(
+            "nvdec: async H.264 channel {context}, {} bytes, surface {output_surface} -> {}",
+            info.bitstream_size,
+            if !frames.is_empty() { "decoded" } else { "no output" },
+        );
+    }
+    let iova = iova.lock().unwrap();
+    let dma = Dma { iova: &iova, mem: &process.memory, gpu: &process.gpu, later: None, h264: None };
+    if frames.is_empty() {
+        let w = (info.width_mbs.max(1) as usize) * 16;
+        let h = (info.height_mbs.max(1) as usize) * 16;
+        let uv_w = w.div_ceil(2) * 2;
+        let uv_h = h.div_ceil(2);
+        let y = to_block_linear(&vec![16u8; w * h], w, w, h, 1);
+        let uv = to_block_linear(&vec![128u8; uv_w * uv_h], uv_w, uv_w, uv_h, 1);
+        let _ = dma.write(luma, &y) && dma.write(chroma, &uv);
+        return Ok(());
+    }
+    for ((out_surface, out_luma, out_chroma), frame) in frames {
+        let y = to_block_linear(&frame.y, frame.width, frame.width, frame.height, 1);
+        let uv_width = frame.width.div_ceil(2) * 2;
+        let uv = to_block_linear(&frame.uv, uv_width, uv_width, frame.height.div_ceil(2), 1);
+        if !dma.write(out_luma, &y) || !dma.write(out_chroma, &uv) {
+            return Err(format!("NVDEC: output surface {out_surface} is not mapped"));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn h264_async() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("KIRIKAE_NVDEC_H264_ASYNC").is_ok_and(|v| v == "1"))
+}
+
+pub(crate) struct SubmitResult {
+    pub(crate) errors: Vec<String>,
+    pub(crate) h264: Vec<H264Completion>,
+}
+
 #[derive(Default)]
 pub struct Host1x {
     iova: Arc<Mutex<Iova>>,
     engines: Mutex<Engines>,
     worker: Arc<Worker>,
+    h264: Arc<H264Worker>,
 }
+
 
 impl Host1x {
     pub fn map_buffer(&self, handle: u32, m: NvMap) -> Option<u32> {
@@ -165,17 +377,23 @@ impl Host1x {
 
     pub fn drain(&self) {
         self.worker.drain();
+        self.h264.drain();
     }
 
-    pub fn submit(&self, p: &'static Process, context: u32, class: u32, words: &[u32]) -> Vec<String> {
+    pub(crate) fn submit(&self, p: &'static Process, context: u32, class: u32, words: &[u32]) -> SubmitResult {
+        let timing = media_timing();
+        let started = timing.then(std::time::Instant::now);
+        let submitted_class = class;
         if class != CLASS_NVDEC {
             self.drain();
         }
+        let drain_us = started.as_ref().map_or(0, |s| s.elapsed().as_micros());
         let (gpu, mem) = (&p.gpu, &p.memory);
         let iova = self.iova.lock().unwrap();
-        let dma = Dma { iova: &iova, mem, gpu, later: Some((p, &self.iova, &self.worker)) };
+        let dma = Dma { iova: &iova, mem, gpu, later: Some((p, &self.iova, &self.worker)), h264: Some(self.h264.clone()) };
         let mut engines = self.engines.lock().unwrap();
         let mut errors = Vec::new();
+        let mut h264 = Vec::new();
         let (mut class, mut offset, mut count, mut mask, mut incrementing) = (class, 0u32, 0u32, 0u32, false);
         for &w in words {
             let reg = if mask != 0 {
@@ -207,20 +425,31 @@ impl Host1x {
                     }
                     4 => {
                         let r = (w >> 16) & 0xfff;
-                        engines.write(&dma, context, class, r, w & 0xfff, &mut errors);
+                        engines.write(&dma, context, class, r, w & 0xfff, &mut errors, &mut h264);
                     }
                     op => errors.push(format!("host1x: opcode {op} is not supported")),
                 }
                 continue;
             };
-            engines.write(&dma, context, class, reg, w, &mut errors);
+            engines.write(&dma, context, class, reg, w, &mut errors, &mut h264);
         }
-        errors
+        if let Some(s) = started {
+            let engine_us = s.elapsed().as_micros().saturating_sub(drain_us);
+            if drain_us >= 1_000 || engine_us >= 1_000 {
+                eprintln!(
+                    "host1x: media timing t={} class {submitted_class:#x} context {context} words {} drain_us {drain_us} engine_us {engine_us} total_us {}",
+                    crate::gpu::gpu_ticks(),
+                    words.len(),
+                    drain_us + engine_us,
+                );
+            }
+        }
+        SubmitResult { errors, h264 }
     }
 }
 
 impl Engines {
-    fn write(&mut self, dma: &Dma, context: u32, class: u32, reg: u32, value: u32, errors: &mut Vec<String>) {
+    fn write(&mut self, dma: &Dma, context: u32, class: u32, reg: u32, value: u32, errors: &mut Vec<String>, h264: &mut Vec<H264Completion>) {
         let method = match class {
             CLASS_NVDEC => &mut self.nvdec_method,
             CLASS_VIC => &mut self.vic_method,
@@ -232,17 +461,32 @@ impl Engines {
         };
         match reg {
             THI_INCR_SYNCPT => {
-                dma.gpu.increment(value & 0xff, 1);
+                if h264.is_empty() {
+                    dma.gpu.increment(value & 0xff, 1);
+                } else if let Some((p, _, _)) = dma.later {
+                    let Some(worker) = dma.h264.as_ref() else { return };
+                    let id = value & 0xff;
+                    let gpu = &p.gpu;
+                    match worker.callback(move || {
+                        gpu.increment(id, 1);
+                        Ok(())
+                    }) {
+                        Ok(done) => h264.push(done),
+                        Err(e) => errors.push(e),
+                    }
+                }
             }
             THI_METHOD0 => *method = value,
             THI_METHOD1 => {
                 let m = *method;
                 let r = match class {
                     CLASS_NVDEC => self.nvdec.write(dma, context, m, value),
-                    _ => self.vic.write(dma, m, value),
+                    _ => self.vic.write(dma, m, value).map(|()| None),
                 };
-                if let Err(e) = r {
-                    errors.push(e);
+                match r {
+                    Ok(Some(done)) => h264.push(done),
+                    Ok(None) => {},
+                    Err(e) => errors.push(e),
                 }
             }
             _ => {}
@@ -334,5 +578,37 @@ mod tests {
         assert!(b as u64 >= a as u64 + 0x2000);
         assert_eq!(io.translate(a as u64 + 0x10, 0x10), Some(0x8000_0010));
         assert_eq!(io.translate(a as u64 + 0x1ff0, 0x20), None);
+    }
+
+    #[test]
+    fn h264_queue_is_bounded_and_fifo() {
+        let mut q = H264Queue::new(2);
+        assert_eq!(q.push(1), Ok(()));
+        assert_eq!(q.push(2), Ok(()));
+        assert_eq!(q.push(3), Err(3));
+        assert_eq!(q.pop(), Some(1));
+        assert_eq!(q.push(3), Ok(()));
+        assert_eq!(q.pop(), Some(2));
+        assert_eq!(q.pop(), Some(3));
+        assert_eq!(q.pop(), None);
+    }
+
+    #[test]
+    fn h264_worker_preserves_callback_order() {
+        let worker = Arc::new(H264Worker::default());
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let first_order = order.clone();
+        let first = worker.callback(move || {
+            first_order.lock().unwrap().push(1);
+            Ok(())
+        }).unwrap();
+        let second_order = order.clone();
+        let second = worker.callback(move || {
+            second_order.lock().unwrap().push(2);
+            Ok(())
+        }).unwrap();
+        first.wait().unwrap();
+        second.wait().unwrap();
+        assert_eq!(*order.lock().unwrap(), [1, 2]);
     }
 }

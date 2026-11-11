@@ -538,6 +538,24 @@ pub(super) fn same_class(a: vk::Format, b: vk::Format) -> bool {
     class(a) == class(b)
 }
 
+pub(super) fn compatible_texture_image(key: ImageKey, requested: vk::Format) -> bool {
+    same_class(key.format, requested)
+}
+
+#[cfg(test)]
+mod texture_compatibility_tests {
+    use super::*;
+
+    #[test]
+    fn reused_compressed_image_requires_the_same_block_format_class() {
+        let old = ImageKey { cpu: 0x1000, format: vk::Format::BC7_UNORM_BLOCK, width: 256, height: 256 };
+        assert!(!compatible_texture_image(old, vk::Format::BC3_UNORM_BLOCK));
+        assert!(compatible_texture_image(old, vk::Format::BC7_SRGB_BLOCK));
+        let matching = ImageKey { format: vk::Format::BC3_UNORM_BLOCK, width: 256, height: 128, ..old };
+        assert!(compatible_texture_image(matching, vk::Format::BC3_UNORM_BLOCK));
+    }
+}
+
 const CLEAR_FLAGS: usize = 0x43e;
 const CLEAR_SCISSOR: u32 = 0x100;
 

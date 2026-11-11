@@ -1443,7 +1443,7 @@ impl<'a> Translator<'a> {
                 let v = self.b.bit_count(u, None, b)?;
                 self.set(i.rd(), v)
             }
-            "ld" => self.load(i),
+            "ld" => self.load(pc, i),
             "st" => self.store(i),
             "ldg" | "stg" => self.global_memory(pc, i),
             "r2p" => {
@@ -2227,7 +2227,7 @@ impl<'a> Translator<'a> {
         self.setp(i.bits(0, 3) as u8, r1)
     }
 
-    fn load(&mut self, i: &Insn) -> R {
+    fn load(&mut self, pc: u32, i: &Insn) -> R {
         match i.op.value {
             0xefd8000000000000 => {
                 let base = i.bits(20, 10) as u32;
@@ -2250,8 +2250,21 @@ impl<'a> Translator<'a> {
                 if i.bits(44, 2) != 0 {
                     self.unsupported.push("ldc (indexed slot)");
                 }
+                let bound = if i.ra() == RZ {
+                    (imm as u32) + 4
+                } else if let Some((&shl_pc, shl)) = self.insns.range(..pc).rev().take(32).find(|(_, insn)| insn.rd() == i.ra())
+                    && shl.name() == "shl"
+                    && let Some((_, mnmx)) = self.insns.range(..shl_pc).rev().take(32).find(|(_, insn)| insn.rd() == shl.ra())
+                    && mnmx.name() == "imnmx"
+                    && mnmx.form() == Form::Imm
+                {
+                    let max_idx = (mnmx.simm20().max(0) as u32).min(255);
+                    (imm as u32).wrapping_add((max_idx + 1) * 4)
+                } else {
+                    u32::MAX
+                };
                 if let Some(used) = self.shader.cbuf_used.get_mut(slot as usize) {
-                    *used = u32::MAX;
+                    *used = (*used).max(bound);
                 }
                 match i.bits(48, 3) {
                     5 => {

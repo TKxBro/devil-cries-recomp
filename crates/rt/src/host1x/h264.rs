@@ -4,6 +4,16 @@ use openh264::decoder::{DecodeOptions, Decoder as OpenH264, DecoderConfig, Flush
 use openh264::formats::YUVSource;
 #[cfg(feature = "h264")]
 use openh264::OpenH264API;
+#[cfg(all(feature = "h264", feature = "ffmpeg-h264"))]
+use ffmpeg_next as ffmpeg;
+#[cfg(all(feature = "h264", feature = "ffmpeg-h264"))]
+use ffmpeg::{codec, frame as ffmpeg_frame};
+#[cfg(all(feature = "h264", feature = "ffmpeg-h264"))]
+use std::collections::VecDeque;
+#[cfg(all(feature = "h264", feature = "ffmpeg-h264"))]
+use std::env;
+#[cfg(feature = "h264")]
+use std::time::Instant;
 
 use super::u32_at;
 
@@ -238,11 +248,177 @@ pub fn parameter_sets(p: &PictureInfo) -> Vec<u8> {
     out
 }
 
+pub type SurfaceTarget = (usize, u32, u32);
+
 pub struct Frame {
     pub width: usize,
     pub height: usize,
     pub y: Vec<u8>,
     pub uv: Vec<u8>,
+}
+
+#[cfg(feature = "h264")]
+fn first_slice_is_reference(slices: &[u8]) -> bool {
+    let mut i = 0;
+    while i + 3 < slices.len() {
+        let header_idx = if slices[i..].starts_with(&[0, 0, 1]) {
+            Some(i + 3)
+        } else if i + 4 < slices.len() && slices[i..].starts_with(&[0, 0, 0, 1]) {
+            Some(i + 4)
+        } else {
+            None
+        };
+        if let Some(idx) = header_idx
+            && let Some(&hdr) = slices.get(idx)
+        {
+            let nal_type = hdr & 0x1f;
+            let nal_ref_idc = (hdr >> 5) & 0x3;
+            if matches!(nal_type, 1 | 5) {
+                return nal_type == 5 || nal_ref_idc != 0;
+            }
+            i = idx + 1;
+            continue;
+        }
+        i += 1;
+    }
+    true
+}
+
+#[cfg(all(feature = "h264", feature = "ffmpeg-h264"))]
+fn copy_ffmpeg_frame(decoded: &ffmpeg_frame::Video) -> Result<Frame, String> {
+    if decoded.format() != ffmpeg::util::format::pixel::Pixel::YUV420P {
+        return Err(format!("FFmpeg H.264 returned {:?}, expected YUV420P", decoded.format()));
+    }
+    let width = decoded.width() as usize;
+    let height = decoded.height() as usize;
+    let cw = width.div_ceil(2);
+    let ch = height.div_ceil(2);
+    let mut y = Vec::with_capacity(width * height);
+    for row in decoded.data(0).chunks(decoded.stride(0)).take(height) {
+        y.extend_from_slice(&row[..width]);
+    }
+    let mut uv = vec![0u8; cw * 2 * ch];
+    for r in 0..ch {
+        let u = &decoded.data(1)[r * decoded.stride(1)..r * decoded.stride(1) + cw];
+        let v = &decoded.data(2)[r * decoded.stride(2)..r * decoded.stride(2) + cw];
+        for i in 0..cw {
+            uv[r * cw * 2 + i * 2] = u[i];
+            uv[r * cw * 2 + i * 2 + 1] = v[i];
+        }
+    }
+    Ok(Frame { width, height, y, uv })
+}
+
+#[cfg(all(feature = "h264", feature = "ffmpeg-h264"))]
+struct FfmpegBackend {
+    inner: ffmpeg::decoder::Video,
+    pending: VecDeque<(SurfaceTarget, Frame)>,
+    queue_capacity: usize,
+    next_pts: i64,
+    targets: std::collections::HashMap<i64, SurfaceTarget>,
+}
+
+#[cfg(all(feature = "h264", feature = "ffmpeg-h264"))]
+impl FfmpegBackend {
+    fn new() -> Result<Self, String> {
+        ffmpeg::init().map_err(|e| format!("FFmpeg init: {e}"))?;
+        let codec = codec::decoder::find(codec::Id::H264)
+            .ok_or_else(|| "FFmpeg H.264 decoder unavailable".to_string())?;
+        let mut context = codec::context::Context::new_with_codec(codec);
+        let thread_count = env::var("KIRIKAE_FFMPEG_THREADS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&v| (1..=16).contains(&v))
+            .unwrap_or(4);
+        let thread_type = match env::var("KIRIKAE_FFMPEG_THREAD_TYPE").as_deref() {
+            Ok("frame") => codec::threading::Type::Frame,
+            _ => codec::threading::Type::Slice,
+        };
+        context.set_threading(codec::threading::Config {
+            kind: thread_type,
+            count: thread_count,
+        });
+        let inner = context
+            .decoder()
+            .video()
+            .map_err(|e| format!("open FFmpeg H.264 decoder: {e}"))?;
+        if env::var_os("KIRIKAE_FFMPEG_DIAGNOSTICS").is_some() {
+            eprintln!("h264: backend=FFmpeg thread_count={thread_count} active={:?}", inner.threading());
+        }
+        let queue_capacity = env::var("KIRIKAE_FFMPEG_QUEUE")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&v| (1..=16).contains(&v))
+            .unwrap_or(8);
+        Ok(Self {
+            inner,
+            pending: VecDeque::with_capacity(queue_capacity),
+            queue_capacity,
+            next_pts: 1,
+            targets: std::collections::HashMap::new(),
+        })
+    }
+
+    fn receive_available(&mut self, fallback: SurfaceTarget) -> Result<(), String> {
+        let mut decoded = ffmpeg_frame::Video::empty();
+        loop {
+            match self.inner.receive_frame(&mut decoded) {
+                Ok(()) => {
+                    if self.pending.len() >= self.queue_capacity {
+                        return Err(format!("FFmpeg H.264 pending queue overflow (capacity {})", self.queue_capacity));
+                    }
+                    let target = decoded.pts().and_then(|pts| self.targets.remove(&pts)).unwrap_or(fallback);
+                    self.pending.push_back((target, copy_ffmpeg_frame(&decoded)?));
+                }
+                Err(ffmpeg::Error::Other { errno }) if errno == ffmpeg::util::error::EAGAIN => break,
+                Err(ffmpeg::Error::Eof) => break,
+                Err(e) => return Err(format!("FFmpeg receive frame: {e}")),
+            }
+        }
+        Ok(())
+    }
+
+    fn decode_surface(&mut self, packet_bytes: &[u8], target: SurfaceTarget) -> Result<Vec<(SurfaceTarget, Frame)>, String> {
+        let pts = self.next_pts;
+        self.next_pts += 1;
+        self.targets.insert(pts, target);
+        let mut packet = ffmpeg::Packet::copy(packet_bytes);
+        packet.set_pts(Some(pts));
+        match self.inner.send_packet(&packet) {
+            Ok(()) => {}
+            Err(ffmpeg::Error::Other { errno }) if errno == ffmpeg::util::error::EAGAIN => {
+                self.receive_available(target)?;
+                self.inner.send_packet(&packet).map_err(|e| format!("FFmpeg send packet after drain: {e}"))?;
+            }
+            Err(e) => return Err(format!("FFmpeg send packet: {e}")),
+        }
+        self.receive_available(target)?;
+        Ok(self.pending.drain(..).collect())
+    }
+
+    fn decode(&mut self, packet: &[u8]) -> Result<Option<Frame>, String> {
+        let pts = self.next_pts;
+        self.next_pts += 1;
+        self.targets.insert(pts, (0, 0, 0));
+        let mut packet = ffmpeg::Packet::copy(packet);
+        packet.set_pts(Some(pts));
+        match self.inner.send_packet(&packet) {
+            Ok(()) => {}
+            Err(ffmpeg::Error::Other { errno }) if errno == ffmpeg::util::error::EAGAIN => {
+                self.receive_available((0, 0, 0))?;
+                self.inner.send_packet(&packet).map_err(|e| format!("FFmpeg send packet after drain: {e}"))?;
+            }
+            Err(e) => return Err(format!("FFmpeg send packet: {e}")),
+        }
+        self.receive_available((0, 0, 0))?;
+        Ok(self.pending.pop_front().map(|(_, f)| f))
+    }
+}
+
+#[cfg(all(feature = "h264", feature = "ffmpeg-h264"))]
+enum Backend {
+    OpenH264(OpenH264),
+    Ffmpeg(FfmpegBackend),
 }
 
 #[cfg(not(feature = "h264"))]
@@ -257,23 +433,111 @@ impl Decoder {
     pub fn decode(&mut self, _info: &PictureInfo, _slices: &[u8]) -> Result<Option<Frame>, String> {
         Err("H.264 support was not built in".into())
     }
+
+    pub fn decode_surface(&mut self, _info: &PictureInfo, _slices: &[u8], _target: SurfaceTarget) -> Result<Vec<(SurfaceTarget, Frame)>, String> {
+        Err("H.264 support was not built in".into())
+    }
 }
 
 #[cfg(feature = "h264")]
 pub struct Decoder {
+    #[cfg(all(feature = "h264", feature = "ffmpeg-h264"))]
+    backend: Backend,
+    #[cfg(not(feature = "ffmpeg-h264"))]
     inner: OpenH264,
     headers: Vec<u8>,
+    held_target: Option<SurfaceTarget>,
+}
+
+#[cfg(feature = "h264")]
+fn log_decode_timing(
+    info: &PictureInfo,
+    packet_us: u128,
+    decode_us: u128,
+    extract_us: u128,
+    total_us: u128,
+    dimensions: Option<(usize, usize)>,
+) {
+    if total_us < 1_000 {
+        return;
+    }
+    let (width, height) = dimensions.unwrap_or((0, 0));
+    eprintln!(
+        "h264: media timing t={} frame_num {} bitstream_size {} width {} height {} packet_us {} decode_us {} extract_us {} total_us {} output {}",
+        crate::gpu::gpu_ticks(),
+        info.frame_num,
+        info.bitstream_size,
+        width,
+        height,
+        packet_us,
+        decode_us,
+        extract_us,
+        total_us,
+        if dimensions.is_some() { "decoded" } else { "none" },
+    );
 }
 
 #[cfg(feature = "h264")]
 impl Decoder {
     pub fn new() -> Result<Decoder, String> {
-        let config = DecoderConfig::new().flush_after_decode(Flush::Flush);
-        let inner = OpenH264::with_api_config(OpenH264API::from_source(), config).map_err(|e| format!("OpenH264: {e}"))?;
-        Ok(Decoder { inner, headers: Vec::new() })
+        let config = DecoderConfig::new().flush_after_decode(Flush::NoFlush);
+        let openh264 = OpenH264::with_api_config(OpenH264API::from_source(), config)
+            .map_err(|e| format!("OpenH264: {e}"))?;
+        #[cfg(feature = "ffmpeg-h264")]
+        let backend = if env::var("KIRIKAE_H264_BACKEND").as_deref() == Ok("openh264") {
+            Backend::OpenH264(openh264)
+        } else {
+            Backend::Ffmpeg(FfmpegBackend::new()?)
+        };
+        #[cfg(feature = "ffmpeg-h264")]
+        return Ok(Decoder { backend, headers: Vec::new(), held_target: None });
+        #[cfg(not(feature = "ffmpeg-h264"))]
+        Ok(Decoder { inner: openh264, headers: Vec::new(), held_target: None })
+    }
+
+    pub fn decode_surface(&mut self, info: &PictureInfo, slices: &[u8], target: SurfaceTarget) -> Result<Vec<(SurfaceTarget, Frame)>, String> {
+        #[cfg(feature = "ffmpeg-h264")]
+        if let Backend::Ffmpeg(backend) = &mut self.backend {
+            let timing = super::media_timing();
+            let total_started = timing.then(Instant::now);
+            let packet_started = timing.then(Instant::now);
+            let headers = parameter_sets(info);
+            let mut packet = Vec::with_capacity(headers.len() + slices.len());
+            if headers != self.headers {
+                packet.extend_from_slice(&headers);
+                self.headers = headers;
+            }
+            packet.extend_from_slice(slices);
+            let packet_us = packet_started.as_ref().map_or(0, |s| s.elapsed().as_micros());
+            let decode_started = timing.then(Instant::now);
+            let result = backend.decode_surface(&packet, target);
+            let decode_us = decode_started.as_ref().map_or(0, |s| s.elapsed().as_micros());
+            if let Some(start) = total_started.as_ref() {
+                let dimensions = result.as_ref().ok().and_then(|v| v.first().map(|(_, f)| (f.width, f.height)));
+                log_decode_timing(info, packet_us, decode_us, 0, start.elapsed().as_micros(), dimensions);
+            }
+            return result;
+        }
+        let is_ref = first_slice_is_reference(slices);
+        let frame = self.decode(info, slices)?;
+        match (is_ref, frame) {
+            (true, Some(f)) => {
+                let out_target = self.held_target.replace(target).unwrap_or(target);
+                Ok(vec![(out_target, f)])
+            }
+            (true, None) => {
+                self.held_target = Some(target);
+                Ok(Vec::new())
+            }
+            (false, Some(f)) => Ok(vec![(target, f)]),
+            (false, None) => Ok(Vec::new()),
+        }
     }
 
     pub fn decode(&mut self, info: &PictureInfo, slices: &[u8]) -> Result<Option<Frame>, String> {
+        let timing = super::media_timing();
+        let total_started = timing.then(Instant::now);
+        let packet_started = timing.then(Instant::now);
         let headers = parameter_sets(info);
         let mut packet = Vec::with_capacity(headers.len() + slices.len());
         if headers != self.headers {
@@ -281,12 +545,47 @@ impl Decoder {
             self.headers = headers;
         }
         packet.extend_from_slice(slices);
-        let options = DecodeOptions::new().flush_after_decode(Flush::Flush);
-        let yuv = match self.inner.decode_with_options(&packet, options) {
-            Ok(Some(yuv)) => yuv,
-            Ok(None) => return Ok(None),
-            Err(e) => return Err(format!("H.264 picture not decoded: {e}")),
+        let packet_us = packet_started.as_ref().map_or(0, |s| s.elapsed().as_micros());
+
+        #[cfg(feature = "ffmpeg-h264")]
+        if let Backend::Ffmpeg(backend) = &mut self.backend {
+            let decode_started = timing.then(Instant::now);
+            let result = backend.decode(&packet);
+            let decode_us = decode_started.as_ref().map_or(0, |s| s.elapsed().as_micros());
+            if let Some(start) = total_started.as_ref() {
+                let dimensions = result.as_ref().ok().and_then(|f| f.as_ref().map(|f| (f.width, f.height)));
+                log_decode_timing(info, packet_us, decode_us, 0, start.elapsed().as_micros(), dimensions);
+            }
+            return result;
+        }
+
+        let options = DecodeOptions::new().flush_after_decode(Flush::NoFlush);
+        let decode_started = timing.then(Instant::now);
+        #[cfg(feature = "ffmpeg-h264")]
+        let decoded = match &mut self.backend {
+            Backend::OpenH264(inner) => inner.decode_with_options(&packet, options),
+            Backend::Ffmpeg(_) => unreachable!("FFmpeg backend returned before OpenH264 path"),
         };
+        #[cfg(not(feature = "ffmpeg-h264"))]
+        let decoded = self.inner.decode_with_options(&packet, options);
+        let decode_us = decode_started.as_ref().map_or(0, |s| s.elapsed().as_micros());
+        let log_timing = |extract_us, dimensions| {
+            if let Some(start) = total_started.as_ref() {
+                log_decode_timing(info, packet_us, decode_us, extract_us, start.elapsed().as_micros(), dimensions);
+            }
+        };
+        let yuv = match decoded {
+            Ok(Some(yuv)) => yuv,
+            Ok(None) => {
+                log_timing(0, None);
+                return Ok(None);
+            }
+            Err(e) => {
+                log_timing(0, None);
+                return Err(format!("H.264 picture not decoded: {e}"));
+            }
+        };
+        let extraction_started = timing.then(Instant::now);
         let (width, height) = yuv.dimensions();
         let (sy, su, sv) = yuv.strides();
         let mut y = Vec::with_capacity(width * height);
@@ -302,6 +601,8 @@ impl Decoder {
                 d[1] = v[i];
             }
         }
+        let extract_us = extraction_started.as_ref().map_or(0, |s| s.elapsed().as_micros());
+        log_timing(extract_us, Some((width, height)));
         Ok(Some(Frame { width, height, y, uv }))
     }
 }
@@ -309,6 +610,20 @@ impl Decoder {
 #[cfg(all(test, feature = "h264"))]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "ffmpeg-h264")]
+    #[test]
+    fn ffmpeg_threading_matches_requested_mode() {
+        let backend = FfmpegBackend::new().expect("FFmpeg H.264 decoder opens");
+        let active = backend.inner.threading();
+        let expected = match env::var("KIRIKAE_FFMPEG_THREAD_TYPE").as_deref() {
+            Ok("frame") => codec::threading::Type::Frame,
+            _ => codec::threading::Type::Slice,
+        };
+        assert_eq!(active.kind, expected);
+        assert_eq!(active.count, 4);
+        eprintln!("FFmpeg H.264 active threading: {active:?}");
+    }
 
     #[test]
     fn exp_golomb() {
@@ -439,15 +754,29 @@ mod tests {
         let setup = setup_from(&sps, &pps);
         let mut reference = OpenH264::new().unwrap();
         let mut ours = Decoder::new().unwrap();
+        let mut expected = std::collections::VecDeque::new();
+        let mut decoded = 0;
         for frame in &frames {
             let slices: Vec<u8> = openh264::nal_units(frame).filter(|n| matches!(nal_type(n), 1 | 5)).flatten().copied().collect();
             let want = reference.decode(frame).unwrap().expect("reference picture");
-            let got = ours.decode(&setup, &slices).unwrap().expect("picture");
-            assert_eq!((got.width, got.height), want.dimensions());
             let stride = want.strides().0;
-            for y in 0..h {
-                assert_eq!(&got.y[y * w..(y + 1) * w], &want.y()[y * stride..y * stride + w], "row {y}");
-            }
+            let y: Vec<u8> = (0..h).flat_map(|y| want.y()[y * stride..y * stride + w].iter().copied()).collect();
+            expected.push_back((want.dimensions(), y));
+            let Some(got) = ours.decode(&setup, &slices).unwrap() else { continue };
+            let (dimensions, y) = expected.pop_front().expect("decoded picture has no reference");
+            assert_eq!((got.width, got.height), dimensions);
+            assert_eq!(got.y, y);
+            decoded += 1;
         }
+        // This generated stream has no reordered pictures. Slice threading emits
+        // each picture immediately; the OpenH264 NoFlush path holds one picture.
+        #[cfg(feature = "ffmpeg-h264")]
+        if matches!(&ours.backend, Backend::Ffmpeg(backend) if backend.inner.threading().kind == codec::threading::Type::Slice) {
+            assert_eq!(decoded, frames.len());
+        } else {
+            assert_eq!(decoded, frames.len() - 1);
+        }
+        #[cfg(not(feature = "ffmpeg-h264"))]
+        assert_eq!(decoded, frames.len() - 1);
     }
 }

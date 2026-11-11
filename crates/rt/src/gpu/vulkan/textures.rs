@@ -6,13 +6,14 @@ use crate::gpu::threed::{CB_SLOTS, address, reg};
 use crate::gpu::tic::{Layout, TextureHeader};
 use crate::gpu::{Gpu, formats, tic};
 use crate::mem::GuestMemory;
-use super::images::{IDENTITY, ImageKey, aspect_of, same_class};
+use super::images::{IDENTITY, ImageKey, aspect_of, compatible_texture_image, same_class};
 use super::readback::bytes_per_pixel;
 use super::tiling::{deswizzle, layer_alignment, layer_size, level_offset};
 use super::{Renderer, hash64};
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) struct TexKey {
+    pub(super) cpu: u64,
     pub(super) tic: [u32; 8],
     pub(super) tsc: [u32; 8],
     pub(super) dim: TexDim,
@@ -138,10 +139,11 @@ impl Renderer {
             let view = if header.texture_type == 5 { self.array_volume(gpu, mem, cpu, &header, &format)? } else { self.volume(gpu, mem, cpu, &header, &format)? };
             return Ok((view, self.sampler(&sampler_state)));
         }
-        let tex_key = TexKey { tic, tsc, dim, array, shadow };
+        let tex_key = TexKey { cpu, tic, tsc, dim, array, shadow };
         if let Some(e) = self.tex_cache.get(&tex_key).copied().filter(|e| !self.draw_targets.contains(&e.image)) {
             if let Some(k) = e.refresh {
-                self.refresh_texture(gpu, mem, k, &header, &format, layers);
+                let refresh_layers = self.images[&k].layers;
+                self.refresh_texture(gpu, mem, k, &header, &format, refresh_layers, false);
             }
             if let Some(like) = e.gather {
                 self.gather(gpu, mem, cpu, &header, &format, like, layers)?;
@@ -159,20 +161,30 @@ impl Renderer {
         self.lap(12, &mut lap);
         let layered = self.layered_image(gpu, mem, cpu, &header, &format)?;
         self.lap(13, &mut lap);
-        let key = match layered.map(|(k, _)| k).or_else(|| self.find_image(cpu, header.width, header.height, format.vk)) {
+        let req_levels = if header.texture_type == 7 { 1 } else { header.levels };
+        let key = match layered.map(|(k, _)| k).or_else(|| {
+            self.find_image(cpu, header.width, header.height, format.vk).filter(|&k| {
+                let img = &self.images[&k];
+                compatible_texture_image(k, format.vk)
+                    && (img.gpu_dirty || (k.width == header.width && k.height == header.height && img.levels == req_levels && img.layers == layers))
+            })
+        }) {
             Some(k) => {
-                if layered.is_none() {
-                    self.refresh_texture(gpu, mem, k, &header, &format, layers);
+                if layered.is_none_or(|(lk, layer)| lk.cpu == cpu && layer == 0) {
+                    let refresh_layers = self.images[&k].layers;
+                    self.refresh_texture(gpu, mem, k, &header, &format, refresh_layers, true);
                     entry.refresh = Some(k);
                 }
                 k
             }
             None => {
                 let key = ImageKey { cpu, format: format.vk, width: header.width, height: header.height };
-                let levels = if header.texture_type == 7 { 1 } else { header.levels };
-                self.create_image(key, levels, layers).map_err(|e| format!("image: {e:?}"))?;
-                self.upload_texture(gpu, mem, key, &header, &format, levels, layers);
-                let hash = texture_hash(gpu, mem, &header, &format, levels, layers).unwrap_or(0);
+                if self.images.contains_key(&key) {
+                    self.destroy_image(key);
+                }
+                self.create_image(key, req_levels, layers).map_err(|e| format!("image: {e:?}"))?;
+                self.upload_texture(gpu, mem, key, &header, &format, req_levels, layers);
+                let hash = texture_hash(gpu, mem, &header, &format, req_levels, layers).unwrap_or(0);
                 let frame = crate::display::FRAMES.load(std::sync::atomic::Ordering::Relaxed);
                 self.images.get_mut(&key).unwrap().source = Some(Source { hash, checked: frame, volatile: false });
                 entry.refresh = Some(key);
@@ -267,11 +279,11 @@ impl Renderer {
         self.upload_layers(key, levels as usize, &data);
     }
 
-    pub(super) fn refresh_texture(&mut self, gpu: &Gpu, mem: &GuestMemory, key: ImageKey, header: &TextureHeader, format: &TexFormat, layers: u32) {
+    pub(super) fn refresh_texture(&mut self, gpu: &Gpu, mem: &GuestMemory, key: ImageKey, header: &TextureHeader, format: &TexFormat, layers: u32, force: bool) {
         let frame = crate::display::FRAMES.load(std::sync::atomic::Ordering::Relaxed);
         let img = &self.images[&key];
         let Some(src) = img.source.filter(|_| !img.gpu_dirty) else { return };
-        let due = if src.volatile { src.checked != frame } else { frame >= src.checked + SOURCE_RECHECK };
+        let due = if force || src.volatile { src.checked != frame } else { frame >= src.checked + SOURCE_RECHECK };
         if !due {
             return;
         }

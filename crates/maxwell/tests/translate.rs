@@ -322,3 +322,26 @@ fn half_pair_operands() {
     assert!(shader.unsupported.is_empty(), "{:?}", shader.unsupported);
     validate(&shader.spirv);
 }
+
+#[test]
+fn ldc_jump_table_bounds_cbuf_usage() {
+    let path = "diagnostics/jukebox-gameplay-20261111-090219/shaders/0100770030_fragment.bin";
+    let Ok(code) = std::fs::read(path) else { return };
+    struct TestEnv;
+    impl kirikae_maxwell::Env for TestEnv {
+        fn cbuf(&self, slot: u32, offset: u32) -> Option<u32> {
+            (slot == 1).then_some(match offset {
+                0 => 0x1f0,
+                4 => 0x200,
+                8 => 0x230,
+                12 => 0x258,
+                _ => return None,
+            })
+        }
+    }
+    let opts = Options::new(Stage::Fragment, 0);
+    let shader = translate(&code, &opts, &TestEnv).unwrap();
+    assert_eq!(shader.cbuf_used[1], 16);
+    assert!(shader.unsupported.is_empty(), "{:?}", shader.unsupported);
+}
+

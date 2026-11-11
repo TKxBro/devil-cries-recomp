@@ -442,6 +442,7 @@ fn engine(c: &Cpu, fd: u32, class: u32, cmd: u32, a: &mut Args) -> Option<u32> {
                     .collect();
                 eprintln!("nvdrv: class {class:#x} SUBMIT {buffers} buffer(s), relocs {relocs:x?}, increments {thresholds:?}");
             }
+            let mut pending_h264 = Vec::new();
             for i in 0..buffers {
                 let (handle, offset, words) = (a.u32(16 + 12 * i), a.u32(20 + 12 * i), a.u32(24 + 12 * i));
                 let Some(m) = gpu.nvmap(handle).filter(|m| m.addr != 0) else { return Some(NV_BAD_VALUE) };
@@ -456,11 +457,17 @@ fn engine(c: &Cpu, fd: u32, class: u32, cmd: u32, a: &mut Args) -> Option<u32> {
                         words[index] = (iova.wrapping_add(target_offset) as u64 >> (shift & 31)) as u32;
                     }
                 }
-                let errors = crate::sched::without_gil(c, || {
+                let result = crate::sched::without_gil(c, || {
                     let _prof = crate::prof::enter(crate::prof::Cat::Video);
                     host1x.submit(p, fd, class, &words)
                 });
-                for e in errors {
+                for e in result.errors {
+                    p.warn_once(e);
+                }
+                pending_h264.extend(result.h264);
+            }
+            for done in pending_h264 {
+                if let Err(e) = done.wait() {
                     p.warn_once(e);
                 }
             }

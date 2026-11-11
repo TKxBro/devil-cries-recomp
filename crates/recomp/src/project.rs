@@ -97,6 +97,11 @@ fn plugin_name(dir: &Path) -> Result<String, String> {
 
 fn manifest(name: &str, build_script: bool, plugins: &[(String, PathBuf)]) -> String {
     let rt = toml_path(&runtime_path());
+    let rt_features = if std::env::var("KIRIKAE_FFMPEG_H264").is_ok_and(|v| v == "1") {
+        ", features = ['ffmpeg-h264']"
+    } else {
+        ""
+    };
     let build = if build_script { "build = \"build.rs\"\n" } else { "" };
     let extra: String = plugins.iter().map(|(n, p)| format!("{n} = {{ path = '{}' }}\n", toml_path(p))).collect();
     format!(
@@ -107,7 +112,7 @@ fn manifest(name: &str, build_script: bool, plugins: &[(String, PathBuf)]) -> St
          publish = false\n\
          {build}\n\
          [dependencies]\n\
-         kirikae-rt = {{ path = '{rt}' }}\n\
+         kirikae-rt = {{ path = '{rt}'{rt_features} }}\n\
          {extra}\n\
          [profile.release]\n\
          opt-level = 3\n\

@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use super::h264::{self, PictureInfo};
 use super::vp9;
-use super::{block_linear_size, to_block_linear, trace, Dma};
+use super::{block_linear_size, h264_async, media_timing, to_block_linear, trace, Dma, H264Completion, H264Job, H264Work};
 
 mod reg {
     pub const APPLICATION_ID: u32 = 0x200 / 4;
@@ -45,7 +45,7 @@ impl Default for Nvdec {
 }
 
 impl Nvdec {
-    pub fn write(&mut self, dma: &Dma, context: u32, method: u32, value: u32) -> Result<(), String> {
+    pub(crate) fn write(&mut self, dma: &Dma, context: u32, method: u32, value: u32) -> Result<Option<H264Completion>, String> {
         if let Some(r) = self.regs.get_mut(method as usize) {
             *r = value;
         }
@@ -53,14 +53,14 @@ impl Nvdec {
             return match self.regs[reg::APPLICATION_ID as usize] {
                 CODEC_H264 => self.decode_h264(dma, context),
                 CODEC_VP8 => Err("NVDEC: VP8 is not supported".into()),
-                CODEC_VP9 => self.decode_vp9(dma, context),
+                CODEC_VP9 => self.decode_vp9(dma, context).map(|()| None),
                 id => Err(format!("NVDEC: codec {id} is not supported")),
             };
         }
-        Ok(())
+        Ok(None)
     }
 
-    fn decode_h264(&mut self, dma: &Dma, context: u32) -> Result<(), String> {
+    fn decode_h264(&mut self, dma: &Dma, context: u32) -> Result<Option<H264Completion>, String> {
         let setup = self.regs[reg::DRV_PIC_SETUP as usize];
         let raw = dma.read(setup, h264::PICTURE_INFO_SIZE).ok_or_else(|| format!("NVDEC: picture setup {setup:#x} is not mapped"))?;
         let info = PictureInfo::parse(&raw);
@@ -68,6 +68,23 @@ impl Nvdec {
         let slices = dma.read(base, info.bitstream_size as usize).ok_or_else(|| format!("NVDEC: bitstream {base:#x} is not mapped"))?;
         if info.field_pic || !info.frame_mbs_only {
             return Err("NVDEC: interlaced H.264 is not supported".into());
+        }
+        let surface = (info.output_surface as usize).min(16);
+        let luma = self.regs[reg::PICTURE_LUMA as usize + surface].wrapping_add(info.luma_frame_offset);
+        let chroma = self.regs[reg::PICTURE_CHROMA as usize + surface].wrapping_add(info.chroma_frame_offset);
+        if h264_async() {
+            let Some(worker) = dma.h264.as_ref() else { return Err("NVDEC: H.264 async worker is unavailable".into()) };
+            let job = H264Job {
+                process: dma.later.map_or_else(|| unreachable!(), |(p, _, _)| p),
+                iova: dma.later.map_or_else(|| unreachable!(), |(_, iova, _)| iova.clone()),
+                context,
+                info,
+                slices,
+                output_surface: surface,
+                luma,
+                chroma,
+            };
+            return worker.enqueue(H264Work::Decode(job)).map(Some);
         }
         if let Some(dir) = std::env::var_os("KIRIKAE_VIDEO_DUMP") {
             let path = std::path::Path::new(&dir).join(format!("nvdec-{context}.h264"));
@@ -80,11 +97,14 @@ impl Nvdec {
             std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
             std::collections::hash_map::Entry::Vacant(e) => e.insert(h264::Decoder::new()?),
         };
-        let frame = decoder.decode(&info, &slices)?;
-        self.pictures += 1;
+        let timing = media_timing();
+        let started = timing.then(std::time::Instant::now);
         let surface = (info.output_surface as usize).min(16);
         let luma = self.regs[reg::PICTURE_LUMA as usize + surface].wrapping_add(info.luma_frame_offset);
         let chroma = self.regs[reg::PICTURE_CHROMA as usize + surface].wrapping_add(info.chroma_frame_offset);
+        let frames = decoder.decode_surface(&info, &slices, (surface, luma, chroma))?;
+        let decode_us = started.as_ref().map_or(0, |s| s.elapsed().as_micros());
+        self.pictures += 1;
         if trace() {
             eprintln!(
                 "nvdec: H.264 picture {} on channel {context}: {}x{} MBs, {} bytes in {} slices, frame_num {}, surface {surface} (luma {:#x}, chroma {:#x}) -> {}",
@@ -96,17 +116,61 @@ impl Nvdec {
                 info.frame_num,
                 (luma as u64) << 8,
                 (chroma as u64) << 8,
-                if frame.is_some() { "decoded" } else { "no output" }
+                if !frames.is_empty() { "decoded" } else { "no output" }
             );
         }
-        let Some(f) = frame else { return Ok(()) };
-        let y = to_block_linear(&f.y, f.width, f.width, f.height, SURFACE_BLOCK_HEIGHT_LOG2);
-        let uv_width = f.width.div_ceil(2) * 2;
-        let uv = to_block_linear(&f.uv, uv_width, uv_width, f.height.div_ceil(2), SURFACE_BLOCK_HEIGHT_LOG2);
-        if !dma.write(luma, &y) || !dma.write(chroma, &uv) {
-            return Err(format!("NVDEC: output surface {surface} is not mapped"));
+        if frames.is_empty() {
+            let w = (info.width_mbs.max(1) as usize) * 16;
+            let h = (info.height_mbs.max(1) as usize) * 16;
+            let uv_w = w.div_ceil(2) * 2;
+            let uv_h = h.div_ceil(2);
+            let y = to_block_linear(&vec![16u8; w * h], w, w, h, SURFACE_BLOCK_HEIGHT_LOG2);
+            let uv = to_block_linear(&vec![128u8; uv_w * uv_h], uv_w, uv_w, uv_h, SURFACE_BLOCK_HEIGHT_LOG2);
+            let _ = dma.write(luma, &y) && dma.write(chroma, &uv);
+            if let Some(s) = started {
+                let total_us = s.elapsed().as_micros();
+                if total_us >= 1_000 {
+                    eprintln!(
+                        "nvdec: media timing t={} picture {} channel {} decode_us {} convert_us 0 write_us 0 total_us {total_us} output none",
+                        crate::gpu::gpu_ticks(),
+                        self.pictures,
+                        context,
+                        decode_us,
+                    );
+                }
+            }
+            return Ok(None);
         }
-        Ok(())
+        let conversion_started = started.as_ref().map(|_| std::time::Instant::now());
+        let mut convert_us = 0u128;
+        let mut write_us = 0u128;
+        for ((out_surface, out_luma, out_chroma), f) in frames {
+            let conv_step = conversion_started.as_ref().map(|_| std::time::Instant::now());
+            let y = to_block_linear(&f.y, f.width, f.width, f.height, SURFACE_BLOCK_HEIGHT_LOG2);
+            let uv_width = f.width.div_ceil(2) * 2;
+            let uv = to_block_linear(&f.uv, uv_width, uv_width, f.height.div_ceil(2), SURFACE_BLOCK_HEIGHT_LOG2);
+            convert_us += conv_step.as_ref().map_or(0, |s| s.elapsed().as_micros());
+            let write_step = conversion_started.as_ref().map(|_| std::time::Instant::now());
+            if !dma.write(out_luma, &y) || !dma.write(out_chroma, &uv) {
+                return Err(format!("NVDEC: output surface {out_surface} is not mapped"));
+            }
+            write_us += write_step.as_ref().map_or(0, |s| s.elapsed().as_micros());
+        }
+        if let Some(s) = started {
+            let total_us = s.elapsed().as_micros();
+            if total_us >= 1_000 {
+                eprintln!(
+                    "nvdec: media timing t={} picture {} channel {} decode_us {} convert_us {} write_us {} total_us {total_us} output decoded",
+                    crate::gpu::gpu_ticks(),
+                    self.pictures,
+                    context,
+                    decode_us,
+                    convert_us,
+                    write_us,
+                );
+            }
+        }
+        Ok(None)
     }
 
     fn decode_vp9(&mut self, dma: &Dma, context: u32) -> Result<(), String> {
